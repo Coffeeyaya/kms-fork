@@ -2,7 +2,9 @@
 
 > **For agents starting a new chat**: read [agent-instructions.md](./agent-instructions.md) first.  
 > A step-by-step tree guide. Confirm each layer before going deeper.  
-> **Current depth → Layer 4 (KeyGen deep dive in progress).**
+> **Current depth → Layer 4 (KeyGen + Encrypt/Decrypt deep dives).**
+>
+> In a hurry? [kms_crypto_notes.md](./kms_crypto_notes.md) is a condensed, one-page version of everything below Layer 3 — read that instead if you just want the crypto, not the click-through commands.
 
 
 ---
@@ -217,58 +219,15 @@ Output: `insecure keygen done - "request_id": "<KEY_ID>"`
 
 ---
 
-#### 2. LWE Variable Generation: Centralized vs. Threshold
+#### 2. The Crypto Behind It (short version)
 
-The LWE key generation equation is:
-$$ \mathbf{b} = \mathbf{A}\mathbf{s} + \mathbf{e} \pmod q $$
+The LWE key generation equation is $\mathbf{b} = \mathbf{A}\mathbf{s} + \mathbf{e} \pmod q$. 
 
-Here is where each mathematical variable is generated in each mode:
+**Centralized**: one server samples $\mathbf{s}, \mathbf{e}$ directly in the KeyGen step and computes everything itself. 
 
-| Variable | Description | Centralized Mode | Threshold Mode (Secure DKG) |
-| :--- | :--- | :--- | :--- |
-| $\mathbf{s}$ | Secret key (secret random vector) | **KeyGen Phase** (sampled by single server) | **Preprocessing Phase** (collaboratively pre-computed as shares) |
-| $\mathbf{e}$ | Error/noise vector | **KeyGen Phase** (sampled by single server) | **Preprocessing Phase** (collaboratively pre-computed as shares) |
-| $\mathbf{A}$ | Public random matrix | **KeyGen Phase** (constructed on the fly) | **KeyGen Phase** (constructed on the fly) |
-| $\mathbf{b}$ | Masked public key | **KeyGen Phase** (calculated as $\mathbf{A}\mathbf{s} + \mathbf{e}$) | **KeyGen Phase** (compiled via MPC using pre-computed shares) |
+**Threshold**: $\mathbf{s}, \mathbf{e}$ are generated as Shamir secret shares across nodes during Preprocessing; KeyGen then builds the LWE public key and key-switching key locally per node (both linear, no MPC), and the Bootstrap Key via a real MPC step (Beaver-triple multiply) — the only non-linear part of the whole flow. Secret key coefficients are **binary** ($s_i \in \{0,1\}$), which turns key-multiplication into a skip/add and keeps noise growth bounded.
 
----
-
-#### 3. Behind the Scenes
-
-##### A. Centralized Mode
-*   **Preprocessing (`insecure-preproc-key-gen`)**: A **dummy placeholder** (no cryptographic work). It registers the `PREPROC_ID`, returns an EIP-712 signature proving the server authorized it, and returns.
-*   **KeyGen (`insecure-key-gen`)**: Performs all the work. Samples the secret key $\mathbf{s}$, calculates the public key $(\mathbf{A}, \mathbf{b})$, signs the key handles, and writes them to local storage (`./keys/PRIV/` and `./keys/PUB/`).
-
-##### B. Threshold Mode
-*   **Preprocessing (`preproc-key-gen`)**: Nodes perform a **real Distributed Key Generation (DKG) preprocessing phase** using Multi-Party Computation (MPC). They pre-compute **binary bit shares** of the secret keys (LWE + GLWE), noise shares, Beaver Triples, and random mask shares.
-*   **KeyGen (`key-gen`)**: Nodes consume the pre-computed key-bit shares from preprocessing and collaboratively build **three separate public artifacts**: the LWE public key $\mathbf{b} = \mathbf{A}\mathbf{s} + \mathbf{e}$ (computed locally, no MPC), the key-switching key (also local), and the bootstrap key (the one step needing real MPC — see below). No single node ever learns the full secret key.
-
-> 🔍 **Deep Dive**: For a complete code flow trace and the MPC math behind DKG Preprocessing and KeyGen, read the [Threshold DKG Deep Dive](./threshold_dkg_deep_dive.md).
-
-> Q: Why do we need Beaver Triples in threshold KeyGen?
-> A: *(Corrected 2026-07-13 — the original answer described BGV's $s^2$ relinearization term, which doesn't exist in this codebase's real path; it traced an unused experimental crate instead of the real one.)* The real reason: TFHE's **Bootstrap Key** is built from GGSW ciphertexts, and encrypting each one requires multiplying a bit of the GLWE key by a bit of the LWE key — both values are secret-shared, so this product can't be computed locally by any single node. Beaver Triples are pre-computed shared triples $(\mathbf{x}, \mathbf{y}, \mathbf{z})$ satisfying $\mathbf{z} = \mathbf{x} \cdot \mathbf{y}$ that let the nodes compute this product collaboratively without revealing either operand. This is the *only* multiplication step in the whole KeyGen phase — the LWE public key and key-switching key are both purely linear/local.
-
-
----
-
-#### 4. Cryptographic Concept: Binary Key Coefficients
-
-> Q: What are the secret key coefficients?
->
-> *(Corrected 2026-07-13 — this section originally said "ternary", $s_i \in \{-1,0,1\}$. That was borrowed from an unused experimental BGV crate that isn't what this KMS actually runs. The real threshold code documents binary coefficients — see `glwe_key.rs:29` and the only preprocessing primitive is `next_bit_vec`, not a ternary equivalent.)*
-
-**Binary coefficients** mean that every entry in the secret key vector $\mathbf{s}$ is chosen from the set $\{ 0, 1 \}$.
-
-This provides two crucial benefits in FHE:
-1.  **Speed (No Multiplication)**: In FHE, you frequently multiply encrypted ciphertexts by secret key coefficients (e.g. during decryption or key switching). Since $s_i \in \{ 0, 1 \}$, multiplication is replaced with a trivial operation:
-    *   If $0$: Do nothing (skip).
-    *   If $1$: Add the ciphertext.
-    This bypasses expensive polynomial multiplications.
-2.  **Noise Control**: Keeping secret key coefficients small and sparse bounds the noise added to the ciphertext during operations, preventing decryption failures.
-
----
-
-> 🔍 **Deep Dive**: For a complete code flow trace, math mapping, and links to relevant source files, read the [KeyGen Deep Dive](./keygen_deep_dive.md).
+> 🔍 **Full detail** (math-to-code mapping, call traces, Mermaid diagrams, Beaver-triple protocol, why coefficients are binary not ternary): [keygen_deep_dive.md](./keygen_deep_dive.md), [threshold_dkg_deep_dive.md](./threshold_dkg_deep_dive.md), or the condensed [kms_crypto_notes.md](./kms_crypto_notes.md#1-the-math-lwe-learning-with-errors).
 
 ---
 
@@ -292,6 +251,10 @@ cargo run --bin kms-core-client -- \
 - Output: a binary blob written to `./ciphertext.bin`
 
 > **Why is this client-only?** Public key cryptography: anyone with the public key can encrypt. Only the server (holding the secret key `s`) can decrypt.
+
+---
+
+> 🔍 **Deep Dive**: for the encryption code path and both threshold decryption protocols (public-decrypt vs. user-decrypt), read [encrypt_decrypt_deep_dive.md](./encrypt_decrypt_deep_dive.md).
 
 ---
 
@@ -375,6 +338,13 @@ Option C: The Math — LWE, public keys, noise
   → Read raw/lwe-math-to-code-mapping.md (has a couple of minor citation errors — see the
      erratum note at the top of keygen_deep_dive.md; the core b=As+e math there is fine)
   → Understand why b = As + e is computationally hard to invert
+
+Option D: Encrypt/Decrypt — client-side encryption, threshold noise-flooding decrypt
+  → Read encrypt_decrypt_deep_dive.md (encryption code path + public-decrypt vs.
+     user-decrypt threshold protocols)
+
+Option E: Just want the condensed version of all of the above?
+  → Read kms_crypto_notes.md — one page, no click-through, covers §1-6 of every deep dive
 ```
 
 ---

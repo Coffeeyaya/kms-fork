@@ -20,7 +20,7 @@ The user (**tsaiyunchen**) is learning the **Zama KMS (Key Management System)** 
 
 ---
 
-## Current Progress (as of 2026-07-13)
+## Current Progress (as of 2026-07-14)
 
 | Layer | Status | Summary |
 |---|---|---|
@@ -28,7 +28,10 @@ The user (**tsaiyunchen**) is learning the **Zama KMS (Key Management System)** 
 | Layer 1 — Compile | ✅ Done | System deps, `cargo build`, what `target/` contains |
 | Layer 2 — Run Server | ✅ Done | Centralized (1-server) + Threshold (4-node) setup |
 | Layer 3 — Run Client | ✅ Done | KeyGen Phases 1-3: preproc → keygen → encrypt → decrypt |
-| Layer 4 — Deep Dive | 🔍 In progress | KeyGen internals (centralized + threshold DKG) |
+| Layer 4 — Deep Dive | ✅ Done | KeyGen (centralized + threshold DKG) and Encrypt/Decrypt, each with their own file |
+
+### Notes de-duplication pass (2026-07-14)
+`tutorial.md` used to re-explain the LWE variable table, the Beaver-triple Q&A, and the binary-vs-ternary coefficient correction inline in Phase 1 — the same content that `keygen_deep_dive.md` / `threshold_dkg_deep_dive.md` cover in more depth. Trimmed those sections down to a short summary + links, so each fact now lives in exactly one file. Also wrote the previously-missing `notes/encrypt_decrypt_deep_dive.md` (existing docs linked to it, but it was never created) by merging the encrypt/decrypt content that was scattered across `tutorial.md` Phase 2/3 and `kms_crypto_notes.md` §4-5. `tutorial.md`'s own checkpoint `Ans:` lines (the user's own written answers) were left untouched — only the agent-authored explanatory `Q:/A:` blocks were trimmed.
 
 ### What was covered in Layer 3 (KeyGen):
 - **LWE math**: `b = As + e`, and how `s`, `e`, `A`, `b` map to Rust structs (`ClientKey`, `FhePublicKey`, `ServerKey`)
@@ -46,27 +49,44 @@ The user (**tsaiyunchen**) is learning the **Zama KMS (Key Management System)** 
 
 ```
 notes/
-├── agent-instructions.md    ← THIS FILE
-├── tutorial.md              ← Main learning journal (the user reads and writes here)
-├── keygen_deep_dive.md      ← Layer 4: KeyGen math, code call traces, Mermaid diagrams
-└── raw/                     ← Original reference notes (read-only)
+├── agent-instructions.md          ← THIS FILE (read first, session continuity)
+├── tutorial.md                    ← Main learning journal: Layers 0-3 (concept map,
+│                                     compile, run server, run client). The user's own
+│                                     checkpoint Ans: are theirs — don't rewrite those.
+├── kms_crypto_notes.md            ← Condensed one-page version of every deep dive below.
+│                                     Read this for a fast, no-click-through pass.
+├── keygen_deep_dive.md            ← Layer 4: KeyGen math, code call traces, Mermaid diagrams
+│                                     (centralized + threshold, both modes in one file)
+├── threshold_dkg_deep_dive.md     ← Layer 4: DKG preprocessing + KeyGen MPC, line-cited
+├── encrypt_decrypt_deep_dive.md   ← Layer 4: encryption code path + threshold decrypt
+│                                     (public-decrypt vs. user-decrypt), code-cited
+└── raw/                           ← Original reference notes (read-only, do not edit)
     ├── kms-keygen-simple.md          Beginner story of centralized keygen
     ├── kms-keygen-deep-dive.md       Detailed function-by-function centralized trace
-    ├── lwe-math-to-code-mapping.md   LWE equation → Rust struct mapping
-    ├── 01_keygen_threshold.md        Threshold DKG flow overview
-    └── kms-folder-and-run-overview.md  Repo layout + run overview
+    ├── lwe-math-to-code-mapping.md   LWE equation → Rust struct mapping (minor errata,
+    │                                 see keygen_deep_dive.md's Erratum note)
+    ├── 01_keygen_threshold.md        Superseded/inaccurate threshold flow — kept for archive
+    ├── 01_keygen_central.md          Early centralized keygen notes
+    ├── 00_run.md                     Early run notes
+    ├── kms-folder-and-run-overview.md  Repo layout + run overview
+    ├── kms-run-centralized-on-codespace.md  Codespace-specific run notes
+    ├── kms-docker-blocked-private-images.md Docker/private-image troubleshooting
+    └── prism-learning-map.md         Original learning-plan brainstorm
+
+Every top-level file links back to tutorial.md and links out to the next-deeper file —
+follow the "Back to:" / "🔍 Deep Dive" lines to navigate the tree instead of guessing paths.
 ```
 
 ---
 
 ## Suggested Next Topics
 
-Ask the user which they want to explore next:
+Layers 0-4 (KeyGen, DKG, Encrypt/Decrypt) are now covered. Ask the user which they want next:
 
-- **A. Encryption deep dive** — how `b = As + e` enables client-side encryption (the math of `u = A^T r + e1`, `v = b^T r + e2 + Encode(m)`)
-- **B. Decryption deep dive** — how the server uses `s` to recover plaintext (`v - s^T u ≈ Encode(m)`)
-- **C. Threshold DKG math** — TFHE secret-key sharing, Beaver Triples for the Bootstrap Key's GGSW step, how `key-gen` works in MPC detail
-- **D. Continue from any `Q:` the user writes in `tutorial.md`**
+- **A. Go deeper on tfhe-rs internals** — the actual LWE encrypt/decrypt arithmetic (`u = A^T r + e1`, `v = b^T r + e2 + Encode(m)`) lives inside the `tfhe-rs` dependency, not this repo — could trace into that crate if the user wants it
+- **B. Noise-flooding math** — why the mask needs to be "big enough" to hide a partial-decryption share, and how that bound is chosen
+- **C. Continue from any `Q:` the user writes in `tutorial.md`**
+- **D. Something outside KeyGen/Encrypt/Decrypt** — e.g. key rotation, custodian recovery, gRPC/mTLS session setup
 
 ---
 

@@ -2,6 +2,8 @@
 
 DKG in threshold mode = preprocessing phase + collaborative online KeyGen. Real code: `core/threshold-execution` (TFHE).
 
+> **Back to:** [tutorial.md](./tutorial.md) · [keygen_deep_dive.md](./keygen_deep_dive.md)
+
 > [!warning] Correction (2026-07-13)
 > An earlier version of this doc traced `core/threshold-bgv`, an unused experimental crate. Wrong claims were "ternary coefficients" and a BGV-style $s^2$ relinearization term — neither exists in the real path below.
 
