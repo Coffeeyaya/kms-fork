@@ -14,12 +14,13 @@ mod s3_operations;
 pub use crate::s3_operations::fetch_public_elements;
 
 use crate::backup::{
-    do_custodian_backup_recovery, do_custodian_recovery_init, do_get_operator_pub_keys,
-    do_new_custodian_context, do_restore_from_backup,
+    do_custodian_backup_recovery, do_custodian_recovery_init, do_destroy_custodian_context,
+    do_get_operator_pub_keys, do_new_custodian_context, do_restore_from_backup,
 };
 use crate::crsgen::{do_abort_crs_gen, do_crsgen, fetch_and_check_crsgen, get_crsgen_responses};
 use crate::decrypt::{
-    PubDecVerificationMaterial, do_public_decrypt, do_user_decrypt, get_public_decrypt_responses,
+    PubDecVerificationMaterial, do_public_decrypt, do_user_decrypt, do_user_decrypt_once,
+    get_public_decrypt_responses,
 };
 use crate::keygen::{
     do_abort_key_gen, do_keygen, do_partial_preproc, do_preproc, fetch_and_check_keygen,
@@ -35,15 +36,14 @@ use kms_grpc::kms::v1::{CiphertextFormat, FheParameter, TypedCiphertext, TypedPl
 use kms_grpc::kms_service::v1::core_service_endpoint_client::CoreServiceEndpointClient;
 use kms_grpc::rpc_types::PubDataType;
 use kms_grpc::{ContextId, KeyId, RequestId};
-use kms_lib::backup::custodian::{InternalCustodianRecoveryOutput, InternalCustodianSetupMessage};
+use kms_lib::backup::custodian::InternalCustodianSetupMessage;
 use kms_lib::client::client_wasm::Client;
 use kms_lib::consts::{
     DEFAULT_EPOCH_ID, DEFAULT_MPC_CONTEXT, DEFAULT_PARAM, SIGNING_KEY_ID, TEST_PARAM,
 };
-use kms_lib::engine::utils::make_extra_data;
-use kms_lib::util::file_handling::{
-    read_element, safe_read_element_versioned, safe_write_element_versioned, write_element,
-};
+use kms_lib::engine::utils::{base64_deserialize, base64_serialize, make_extra_data};
+use kms_lib::util::file_handling::{read_element, write_element};
+
 use kms_lib::util::key_setup::{
     ensure_client_keys_exist,
     test_tools::{EncryptionConfig, TestingPlaintext, compute_cipher_from_stored_key},
@@ -67,8 +67,9 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use validator::{Validate, ValidationError};
 
-// time to sleep between retries of requests in milliseconds
+// time to sleep between `get_result` poll requests in milliseconds
 const SLEEP_TIME_BETWEEN_REQUESTS_MS: u64 = 500;
+const USER_DECRYPT_DRAIN_TIMEOUT_SECS: u64 = 30;
 
 /// Retries a function a given number of times with a given interval between retries.
 macro_rules! retry {
@@ -351,6 +352,47 @@ fn validate_cipher_args(cf: &CipherArguments) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_user_decrypt_args(cf: &UserDecryptArguments) -> anyhow::Result<()> {
+    if cf.get_batch_size() == 0 {
+        return Err(anyhow::anyhow!("Batch size cannot be zero."));
+    }
+
+    match (cf.get_rate(), cf.get_duration()) {
+        (None, None) => {
+            if cf.get_max_in_flight().is_some() {
+                return Err(anyhow::anyhow!(
+                    "--max-in-flight requires --rate and --duration."
+                ));
+            }
+        }
+        (Some(_), None) => {
+            return Err(anyhow::anyhow!(
+                "--duration is required when --rate is set."
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(anyhow::anyhow!(
+                "--rate is required when --duration is set."
+            ));
+        }
+        (Some(0), Some(_)) => {
+            return Err(anyhow::anyhow!("Rate cannot be zero."));
+        }
+        (Some(_), Some(0)) => {
+            return Err(anyhow::anyhow!("Duration cannot be zero."));
+        }
+        (Some(_), Some(_)) => {
+            if let Some(max_in_flight) = cf.get_max_in_flight()
+                && max_in_flight == 0
+            {
+                return Err(anyhow::anyhow!("Max in-flight cannot be zero."));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl<'de> Deserialize<'de> for CoreClientConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -602,9 +644,45 @@ impl CipherArguments {
     }
 }
 
+#[derive(Debug, Subcommand, Clone)]
+pub enum UserDecryptArguments {
+    FromFile(UserDecryptFile),
+    FromArgs(UserDecryptParameters),
+}
+
+impl UserDecryptArguments {
+    pub fn get_batch_size(&self) -> usize {
+        match self {
+            UserDecryptArguments::FromFile(cipher_file) => cipher_file.batch_size,
+            UserDecryptArguments::FromArgs(cipher_parameters) => cipher_parameters.batch_size,
+        }
+    }
+
+    pub fn get_rate(&self) -> Option<u64> {
+        match self {
+            UserDecryptArguments::FromFile(cipher_file) => cipher_file.rate,
+            UserDecryptArguments::FromArgs(cipher_parameters) => cipher_parameters.rate,
+        }
+    }
+
+    pub fn get_duration(&self) -> Option<u64> {
+        match self {
+            UserDecryptArguments::FromFile(cipher_file) => cipher_file.duration,
+            UserDecryptArguments::FromArgs(cipher_parameters) => cipher_parameters.duration,
+        }
+    }
+
+    pub fn get_max_in_flight(&self) -> Option<usize> {
+        match self {
+            UserDecryptArguments::FromFile(cipher_file) => cipher_file.max_in_flight,
+            UserDecryptArguments::FromArgs(cipher_parameters) => cipher_parameters.max_in_flight,
+        }
+    }
+}
+
 #[derive(Debug, Args, Clone, Serialize, Deserialize)]
 pub struct CipherParameters {
-    /// Hex value to encrypt and request a public/user decryption.
+    /// Hex value to encrypt for encryption/public-decryption commands.
     /// The value will be converted from a little endian hex string to a `Vec<u8>`.
     /// Can optionally have a "0x" prefix.
     #[clap(long, short = 'e')]
@@ -621,7 +699,7 @@ pub struct CipherParameters {
     /// Default: False, i.e. the SnS is precomputed on the core client.
     #[clap(long, alias = "ns")]
     pub no_precompute_sns: bool,
-    /// Key identifier to use for public/user decryption.
+    /// Key identifier to use for public decryption.
     #[clap(long, short = 'k')]
     pub key_id: KeyId,
     /// Optionally specify the context ID to use for the decryption.
@@ -674,6 +752,88 @@ pub struct CipherFile {
     /// Number of requests to be sent in parallel (at most num_requests) before waiting for inter_request_delay_ms.
     #[clap(long, short = 'p', default_value_t = 0)]
     pub parallel_requests: usize,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct UserDecryptParameters {
+    /// Hex value to encrypt and request a user decryption.
+    /// The value will be converted from a little endian hex string to a `Vec<u8>`.
+    /// Can optionally have a "0x" prefix.
+    #[clap(long, short = 'e')]
+    pub to_encrypt: String,
+    /// Data type of `to_encrypt`.
+    /// Expected one of ebool, euint8, ..., euint256
+    #[clap(long, short = 'd')]
+    pub data_type: FheType,
+    /// Disable ciphertext compression. Default: False, i.e. compression is used.
+    #[clap(long, alias = "nc")]
+    pub no_compression: bool,
+    /// Disable SnS preprocessing on the ciphertext on the core-client.
+    /// SnS preprocessing performs a PBS to convert 64-bit ciphertexts to 128-bit ones.
+    /// Default: False, i.e. the SnS is precomputed on the core client.
+    #[clap(long, alias = "ns")]
+    pub no_precompute_sns: bool,
+    /// Key identifier to use for user decryption.
+    #[clap(long, short = 'k')]
+    pub key_id: KeyId,
+    /// Optionally specify the context ID to use for the decryption.
+    /// If not specified, the default context will be used.
+    #[clap(long)]
+    pub context_id: Option<ContextId>,
+    /// Optionally specify the epoch ID to use for the decryption.
+    /// If not specified, the default epoch will be used.
+    #[clap(long)]
+    pub epoch_id: Option<EpochId>,
+    /// Number of copies of the ciphertext to process in a single request.
+    #[clap(long, short = 'b', default_value_t = 1)]
+    pub batch_size: usize,
+    /// Request launch rate, in requests per second. Must be used together with `--duration`.
+    #[clap(long)]
+    pub rate: Option<u64>,
+    /// Rate-mode duration, in seconds. Must be used together with `--rate`.
+    #[clap(long)]
+    pub duration: Option<u64>,
+    /// Maximum number of in-flight requests allowed during a rate-mode run.
+    #[clap(long)]
+    pub max_in_flight: Option<usize>,
+}
+
+impl UserDecryptParameters {
+    fn to_cipher_parameters(&self) -> CipherParameters {
+        CipherParameters {
+            to_encrypt: self.to_encrypt.clone(),
+            data_type: self.data_type,
+            no_compression: self.no_compression,
+            no_precompute_sns: self.no_precompute_sns,
+            key_id: self.key_id,
+            context_id: self.context_id,
+            epoch_id: self.epoch_id,
+            batch_size: self.batch_size,
+            num_requests: 1,
+            ciphertext_output_path: None,
+            inter_request_delay_ms: 0,
+            parallel_requests: 0,
+        }
+    }
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct UserDecryptFile {
+    /// Input file of the ciphertext.
+    #[clap(long)]
+    pub input_path: PathBuf,
+    /// Number of copies of the ciphertext to process in a single request.
+    #[clap(long, short = 'b', default_value_t = 1)]
+    pub batch_size: usize,
+    /// Request launch rate, in requests per second. Must be used together with `--duration`.
+    #[clap(long)]
+    pub rate: Option<u64>,
+    /// Rate-mode duration, in seconds. Must be used together with `--rate`.
+    #[clap(long)]
+    pub duration: Option<u64>,
+    /// Maximum number of in-flight requests allowed during a rate-mode run.
+    #[clap(long)]
+    pub max_in_flight: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -755,11 +915,12 @@ impl Default for CrsParameters {
 pub struct NewCustodianContextParameters {
     #[clap(long, short = 't')]
     pub threshold: u32,
+    /// The base64-encoded custodian setup messages, as printed by `kms-custodian generate`.
     #[clap(long, short = 'm')]
-    pub setup_msg_paths: Vec<PathBuf>,
+    pub setup_msgs: Vec<String>,
     /// The MPC context ID for which the custodian context is being created.
-    #[clap(long, short = 'c')]
-    pub mpc_context_id: String,
+    #[clap(long, short = 'i')]
+    pub mpc_context_id: ContextId,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -789,6 +950,15 @@ pub struct DestroyMpcContextParameters {
     /// disk (hazmat).
     #[clap(long, value_delimiter = ',')]
     pub epoch_ids: Vec<EpochId>,
+}
+
+#[derive(Debug, Parser, Clone)]
+pub struct DestroyCustodianContextParameters {
+    /// The custodian context ID to destroy, as returned by `new-custodian-context`.
+    /// This must NOT be the currently active custodian context (destroying a context also
+    /// purges all of its backups).
+    #[clap(long, short = 'i')]
+    pub custodian_context_id: RequestId,
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -895,9 +1065,6 @@ pub struct RecoveryInitParameters {
     /// If false, the call will be indempotent, if true, this will not be the case
     #[clap(long, short = 'o', default_value_t = false)]
     pub overwrite_ephemeral_key: bool,
-    /// Paths to write the operator responses, the responses stored in these paths are not ordered.
-    #[clap(long, short = 'r')]
-    pub operator_recovery_resp_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -906,7 +1073,7 @@ pub struct RecoveryParameters {
     #[clap(long, short = 'i')]
     pub custodian_context_id: RequestId,
     #[clap(long, short = 'r')]
-    pub custodian_recovery_outputs: Vec<PathBuf>,
+    pub custodian_recovery_outputs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1047,7 +1214,7 @@ pub enum CCCommand {
     PublicDecrypt(CipherArguments),
     PublicDecryptResult(PublicDecryptResultParameters),
     #[clap(subcommand)]
-    UserDecrypt(CipherArguments),
+    UserDecrypt(UserDecryptArguments),
     CrsGen(CrsParameters),
     CrsGenResult(CrsGenResultParameters),
     AbortCrsGen(AbortParameters),
@@ -1062,6 +1229,7 @@ pub enum CCCommand {
     #[clap(subcommand)]
     NewMpcContext(NewMpcContextParameters),
     DestroyMpcContext(DestroyMpcContextParameters),
+    DestroyCustodianContext(DestroyCustodianContextParameters),
     DestroyMpcEpoch(DestroyMpcEpochParameters),
     #[cfg(feature = "testing")]
     NewTestingMpcContextFile(NewTestingMpcContextFileParameters),
@@ -1946,7 +2114,7 @@ pub async fn execute_cmd(
             .await?
         }
         CCCommand::UserDecrypt(cipher_args) => {
-            validate_cipher_args(cipher_args)?;
+            validate_user_decrypt_args(cipher_args)?;
             let internal_client = Arc::new(RwLock::new(
                 internal_client.expect("UserDecrypt requires a KMS client"),
             ));
@@ -1964,10 +2132,10 @@ pub async fn execute_cmd(
                 context_id,
                 epoch_id,
             } = match cipher_args {
-                CipherArguments::FromFile(cipher_file) => {
+                UserDecryptArguments::FromFile(cipher_file) => {
                     fetch_ctxt_from_file(cipher_file.input_path.clone()).await?
                 }
-                CipherArguments::FromArgs(cipher_parameters) => {
+                UserDecryptArguments::FromArgs(cipher_parameters) => {
                     //Only need to fetch tfhe keys if we are not sourcing the ctxt from file
                     let party_confs = fetch_keys_auto_detect(
                         &cipher_parameters.key_id.as_str(),
@@ -1987,7 +2155,7 @@ pub async fn execute_cmd(
                     encrypt(
                         destination_prefix,
                         storage_prefix,
-                        cipher_parameters.clone(),
+                        cipher_parameters.to_cipher_parameters(),
                     )
                     .await?
                 }
@@ -2003,25 +2171,52 @@ pub async fn execute_cmd(
                 cipher_args.get_batch_size()
             ];
 
-            do_user_decrypt(
-                &mut rng,
-                cipher_args.get_num_requests(),
-                internal_client,
-                ct_batch,
-                key_id,
-                context_id,
-                epoch_id,
-                &core_endpoints_req,
-                &core_endpoints_resp,
-                ptxt,
-                num_parties,
-                max_iter,
-                num_expected_responses,
-                cipher_args.get_inter_request_delay_ms(),
-                cipher_args.get_parallel_requests(),
-                cc_conf.default_domain()?,
-            )
-            .await?
+            match (cipher_args.get_rate(), cipher_args.get_duration()) {
+                (Some(rate), Some(duration)) => {
+                    let max_in_flight = cipher_args
+                        .get_max_in_flight()
+                        .unwrap_or_else(|| (rate as usize).saturating_mul(10).max(1));
+                    do_user_decrypt(
+                        &mut rng,
+                        rate,
+                        duration,
+                        max_in_flight,
+                        USER_DECRYPT_DRAIN_TIMEOUT_SECS,
+                        internal_client,
+                        ct_batch,
+                        key_id,
+                        context_id,
+                        epoch_id,
+                        &core_endpoints_req,
+                        &core_endpoints_resp,
+                        ptxt,
+                        num_parties,
+                        max_iter,
+                        num_expected_responses,
+                        cc_conf.default_domain()?,
+                    )
+                    .await?
+                }
+                (None, None) => {
+                    do_user_decrypt_once(
+                        &mut rng,
+                        internal_client,
+                        ct_batch,
+                        key_id,
+                        context_id,
+                        epoch_id,
+                        &core_endpoints_req,
+                        &core_endpoints_resp,
+                        ptxt,
+                        num_parties,
+                        max_iter,
+                        num_expected_responses,
+                        cc_conf.default_domain()?,
+                    )
+                    .await?
+                }
+                _ => unreachable!("user-decrypt rate arguments are validated before dispatch"),
+            }
         }
         CCCommand::KeyGen(KeyGenParameters {
             preproc_id,
@@ -2482,27 +2677,16 @@ pub async fn execute_cmd(
         }
         CCCommand::NewCustodianContext(new_custodian_context_parameters) => {
             let mut setup_msgs = Vec::new();
-            for cur_path in &new_custodian_context_parameters.setup_msg_paths {
-                let cur_setup: InternalCustodianSetupMessage =
-                    safe_read_element_versioned(cur_path).await?;
+            for cur_setup_msg in &new_custodian_context_parameters.setup_msgs {
+                let cur_setup: InternalCustodianSetupMessage = base64_deserialize(cur_setup_msg)?;
                 setup_msgs.push(cur_setup);
             }
-            let mpc_context_id = ContextId::try_from(
-                &new_custodian_context_parameters.mpc_context_id,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Invalid MPC context ID '{}': {}",
-                    new_custodian_context_parameters.mpc_context_id,
-                    e
-                )
-            })?;
             let context_id = do_new_custodian_context(
                 &core_endpoints_req,
                 &mut rng,
                 new_custodian_context_parameters.threshold,
                 setup_msgs,
-                mpc_context_id,
+                new_custodian_context_parameters.mpc_context_id,
             )
             .await?;
             vec![(
@@ -2516,42 +2700,39 @@ pub async fn execute_cmd(
         }
         CCCommand::CustodianRecoveryInit(RecoveryInitParameters {
             overwrite_ephemeral_key,
-            operator_recovery_resp_paths,
         }) => {
-            assert_eq!(
-                operator_recovery_resp_paths.len(),
-                num_cores,
-                "Number of operator recovery response paths must match number of operators (cores) in the configuration files"
-            );
+            // TODO(#3042) - currently we require backup operations to be done with a single core.
+            // This issue streamlines this and requires an update in this section
+            if num_cores != 1 {
+                return Err("Custodian recovery init is only supported for a single core".into());
+            }
             let res =
                 do_custodian_recovery_init(&core_endpoints_req, *overwrite_ephemeral_key).await?;
-            assert_eq!(res.len(), operator_recovery_resp_paths.len());
 
-            // no ordering of results and paths here
-            for (cur_res, cur_path) in res.into_iter().zip(operator_recovery_resp_paths) {
-                safe_write_element_versioned(cur_path, &cur_res).await?;
-            }
+            let serialized_res = base64_serialize(
+                res.first()
+                    .expect("Expected at least one response for custodian recovery init"),
+            )?;
+            tracing::info!("Serialized custodian result");
 
-            vec![(
-                None,
-                "custodian recovery init queried and recovery request stored".to_string(),
-            )]
+            vec![(None, serialized_res)]
         }
         CCCommand::CustodianBackupRecovery(RecoveryParameters {
             custodian_context_id,
             custodian_recovery_outputs,
         }) => {
+            if num_cores != 1 {
+                return Err("Custodian recovery is only supported for a single core".into());
+            }
             // We assume the output files are ordered the same way as the operators in the configuration file.
-            let mut custodian_outputs = Vec::new();
-            for recovery_path in custodian_recovery_outputs {
-                let read_recovery: InternalCustodianRecoveryOutput =
-                    safe_read_element_versioned(&recovery_path).await?;
-                custodian_outputs.push(read_recovery);
+            let mut deserialized_rec_out = Vec::new();
+            for cur_cus_rec in custodian_recovery_outputs {
+                deserialized_rec_out.push(base64_deserialize(cur_cus_rec)?);
             }
             do_custodian_backup_recovery(
                 &core_endpoints_req,
                 *custodian_context_id,
-                custodian_outputs,
+                deserialized_rec_out,
             )
             .await?;
             vec![(
@@ -2639,6 +2820,18 @@ pub async fn execute_cmd(
             vec![(
                 Some((*context_id).into()),
                 "context destruction done".to_string(),
+            )]
+        }
+        CCCommand::DestroyCustodianContext(DestroyCustodianContextParameters {
+            custodian_context_id,
+        }) => {
+            if num_cores != 1 {
+                return Err("Custodian destruction is only supported for a single core".into());
+            }
+            do_destroy_custodian_context(&core_endpoints_req, custodian_context_id).await?;
+            vec![(
+                Some(*custodian_context_id),
+                "custodian context destruction done".to_string(),
             )]
         }
         CCCommand::DestroyMpcEpoch(DestroyMpcEpochParameters { epoch_id }) => {
@@ -2731,32 +2924,37 @@ fn compute_stat_on_durations(durations: &[tokio::time::Duration]) -> DurationSta
         max,
     }
 }
-// Prints the timings for the command execution, showing latency and throughput based on the measured durations.
-fn print_timings(
+
+/// Reports latency + collect-only throughput for a decrypt command. The heavy client-side
+/// reconstruction/verification is excluded from the throughput figure (reported on its own line)
+/// so it reflects the KMS serving rate.
+fn print_phased_timings(
     cmd: &str,
-    total_client_durations: &[tokio::time::Duration],
-    durations_to_get_responses: &[tokio::time::Duration],
-    start: tokio::time::Instant,
+    collect_elapsed: tokio::time::Duration,
+    response_durations: &[tokio::time::Duration],
+    reconstruct_elapsed: tokio::time::Duration,
 ) {
-    let num_results = total_client_durations.len();
-    // compute total time that is elapsed since we sent the first request
-    let total_elapsed = start.elapsed();
+    let num_results = response_durations.len();
+    let response_duration_stat = compute_stat_on_durations(response_durations);
 
-    // compute latency values
-    let total_duration_stat = compute_stat_on_durations(total_client_durations);
-    let response_duration_stat = compute_stat_on_durations(durations_to_get_responses);
+    let latency_line = format!("Latency for {cmd}: {response_duration_stat}");
+    tracing::info!("{latency_line}");
+    println!("{latency_line}");
 
-    tracing::debug!("Client total latency for {cmd}: {}", total_duration_stat);
-
-    tracing::info!("Latency for {cmd}: {}", response_duration_stat);
-
-    tracing::info!(
-        "Total elapsed time for {cmd} with {num_results} collected results: {total_elapsed:?}. Throughput: {} requests/s",
-        num_results as f64 / total_elapsed.as_secs_f64()
+    // This is the line the CI perf harness parses ("Throughput: N requests/s"). Collection only, i.e. the KMS serving
+    // rate, excluding client-side reconstruction.
+    let throughput_line = format!(
+        "Collected {num_results} results for {cmd} in {collect_elapsed:?}. Throughput: {} requests/s",
+        num_results as f64 / collect_elapsed.as_secs_f64(),
     );
+    tracing::info!("{throughput_line}");
+    println!("{throughput_line}");
 
-    // For debugging, print all collected durations
-    tracing::debug!("All durations: {:?}", total_client_durations);
+    let reconstruction_line = format!(
+        "Client-side reconstruction + verification for {cmd} of {num_results} results took {reconstruct_elapsed:?}"
+    );
+    tracing::info!("{reconstruction_line}");
+    println!("{reconstruction_line}");
 }
 
 #[cfg(test)]
@@ -2820,6 +3018,112 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    fn test_cipher_parameters() -> CipherParameters {
+        CipherParameters {
+            to_encrypt: "0x1".to_string(),
+            data_type: FheType::Ebool,
+            no_compression: false,
+            no_precompute_sns: true,
+            key_id: derive_request_id("user_decrypt_args").unwrap().into(),
+            context_id: None,
+            epoch_id: None,
+            batch_size: 1,
+            num_requests: 1,
+            inter_request_delay_ms: 0,
+            ciphertext_output_path: None,
+            parallel_requests: 0,
+        }
+    }
+
+    fn test_user_decrypt_parameters() -> UserDecryptParameters {
+        UserDecryptParameters {
+            to_encrypt: "0x1".to_string(),
+            data_type: FheType::Ebool,
+            no_compression: false,
+            no_precompute_sns: true,
+            key_id: derive_request_id("user_decrypt_args").unwrap().into(),
+            context_id: None,
+            epoch_id: None,
+            batch_size: 1,
+            rate: Some(10),
+            duration: Some(10),
+            max_in_flight: None,
+        }
+    }
+
+    #[test]
+    fn test_cipher_args_validation() {
+        let assert_error_contains = |params: CipherParameters, expected: &str| {
+            let err = validate_cipher_args(&CipherArguments::FromArgs(params)).unwrap_err();
+            assert!(err.to_string().contains(expected));
+        };
+
+        let mut params = test_cipher_parameters();
+        params.num_requests = 0;
+        assert_error_contains(params, "Number of requests");
+
+        let mut params = test_cipher_parameters();
+        params.batch_size = 0;
+        assert_error_contains(params, "Batch size");
+
+        let mut params = test_cipher_parameters();
+        params.num_requests = 1;
+        params.parallel_requests = 1;
+        validate_cipher_args(&CipherArguments::FromArgs(params.clone())).unwrap();
+
+        params.parallel_requests = 2;
+        assert_error_contains(params, "parallel requests");
+    }
+
+    #[test]
+    fn test_user_decrypt_args_validation() {
+        let assert_error_contains = |params: UserDecryptParameters, expected: &str| {
+            let err =
+                validate_user_decrypt_args(&UserDecryptArguments::FromArgs(params)).unwrap_err();
+            assert!(err.to_string().contains(expected));
+        };
+
+        let params = test_user_decrypt_parameters();
+        validate_user_decrypt_args(&UserDecryptArguments::FromArgs(params)).unwrap();
+
+        let mut params = test_user_decrypt_parameters();
+        params.rate = None;
+        params.duration = None;
+        validate_user_decrypt_args(&UserDecryptArguments::FromArgs(params)).unwrap();
+
+        let mut params = test_user_decrypt_parameters();
+        params.batch_size = 0;
+        assert_error_contains(params, "Batch size");
+
+        let mut params = test_user_decrypt_parameters();
+        params.rate = Some(0);
+        assert_error_contains(params, "Rate");
+
+        let mut params = test_user_decrypt_parameters();
+        params.duration = Some(0);
+        assert_error_contains(params, "Duration");
+
+        let mut params = test_user_decrypt_parameters();
+        params.max_in_flight = Some(0);
+        assert_error_contains(params, "Max in-flight");
+
+        let mut params = test_user_decrypt_parameters();
+        params.rate = Some(10);
+        params.duration = None;
+        assert_error_contains(params, "--duration");
+
+        let mut params = test_user_decrypt_parameters();
+        params.rate = None;
+        params.duration = Some(10);
+        assert_error_contains(params, "--rate");
+
+        let mut params = test_user_decrypt_parameters();
+        params.rate = None;
+        params.duration = None;
+        params.max_in_flight = Some(10);
+        assert_error_contains(params, "--max-in-flight");
     }
 
     #[test]

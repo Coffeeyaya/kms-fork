@@ -10,9 +10,7 @@ use kms_grpc::kms::v1::FheParameter;
 use kms_grpc::rpc_types::PubDataType;
 use kms_lib::DecryptionMode;
 use kms_lib::client::test_tools::ServerHandle;
-use kms_lib::consts::{
-    DEFAULT_EPOCH_ID, DEFAULT_MPC_CONTEXT, ID_LENGTH, SAFE_SER_SIZE_LIMIT, SIGNING_KEY_ID,
-};
+use kms_lib::consts::{DEFAULT_EPOCH_ID, DEFAULT_MPC_CONTEXT, ID_LENGTH, SAFE_SER_SIZE_LIMIT};
 use kms_lib::testing::prelude::*;
 use observability::conf::Settings;
 use serde::Deserialize;
@@ -31,9 +29,8 @@ use validator::Validate;
 use kms_core_client::mpc_context::create_test_context_info_from_core_config;
 use kms_grpc::identifiers::EpochId;
 use kms_grpc::{ContextId, RequestId};
-use kms_lib::backup::SEED_PHRASE_DESC;
+use kms_lib::backup::{RECOVERY_OUTPUT_DESC, SEED_PHRASE_DESC, SETUP_MESSAGE_DESC};
 use kms_lib::engine::base::derive_request_id;
-use std::fs::create_dir_all;
 use std::process::{Command, Output};
 use tfhe::safe_serialization::safe_serialize;
 
@@ -56,9 +53,30 @@ fn write_core_client_toml(path: &Path, cfg: &CoreClientConfig) -> Result<()> {
     Ok(())
 }
 
+/// Derive a single-core client config from a multi-core one by keeping only the
+/// first core. This is used for custodian backup tests.
+fn single_core_config(config_path: &Path) -> Result<PathBuf> {
+    let initial_file_name = config_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("No file name in config path: {config_path:?}"))?
+        .to_string_lossy();
+    let raw = std::fs::read_to_string(config_path)?;
+    let mut cfg: CoreClientConfig =
+        toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing client config: {e}"))?;
+    cfg.cores.truncate(1);
+    let single_path = config_path.with_file_name(format!("{}_single.toml", initial_file_name));
+    write_core_client_toml(&single_path, &cfg)?;
+    Ok(single_path)
+}
+
 /// Mock PCR value used for TLS auto mode in test configs.
 /// This must match the value the test enclave mock expects.
 const MOCK_PCR: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f";
+
+/// Polling budget (number of `get_*_result` retries) for real, secure MPC
+/// operations — preprocessing, key generation and CRS ceremonies.
+/// I.e how many `SLEEP_TIME_BETWEEN_REQUESTS_MS` intervals to wait before giving up and treating the operation as failed.
+const SLOW_OP_MAX_ITER: usize = 6000;
 
 /// Build a minimal `CoreConfig` for a threshold test party.
 fn build_test_core_config(
@@ -85,6 +103,7 @@ fn build_test_core_config(
             timeout_secs: 30,
             grpc_max_message_size: 104_857_600,
         },
+        enclave_bootstrap: None,
         telemetry: None,
         aws: Some(AWSConfig {
             region: "us-east-1".to_string(),
@@ -121,7 +140,6 @@ fn build_test_core_config(
                     pcr1: mock_pcr_bytes.clone(),
                     pcr2: mock_pcr_bytes,
                 }],
-                ignore_aws_ca_chain: None,
                 attest_private_vault_root_key: None,
                 renew_slack_after_expiration: None,
                 renew_fail_retry_timeout: None,
@@ -997,6 +1015,40 @@ fn cipher_params(
     }
 }
 
+/// Build `UserDecryptParameters` with a tiny rate-based run for integration tests.
+fn user_decrypt_params(
+    to_encrypt: &str,
+    data_type: FheType,
+    key_id: KeyId,
+    batch_size: usize,
+    no_compression: bool,
+    no_precompute_sns: bool,
+) -> UserDecryptParameters {
+    UserDecryptParameters {
+        to_encrypt: to_encrypt.to_string(),
+        data_type,
+        no_compression,
+        no_precompute_sns,
+        key_id,
+        context_id: None,
+        epoch_id: None,
+        batch_size,
+        rate: Some(1),
+        duration: Some(1),
+        max_in_flight: Some(10),
+    }
+}
+
+fn user_decrypt_file(input_path: PathBuf, batch_size: usize) -> UserDecryptFile {
+    UserDecryptFile {
+        input_path,
+        batch_size,
+        rate: Some(1),
+        duration: Some(1),
+        max_in_flight: Some(10),
+    }
+}
+
 /// Helper to run insecure preprocessing and key generation via CLI.
 async fn insecure_key_gen(
     config_path: &Path,
@@ -1049,7 +1101,7 @@ async fn crs_gen(config_path: &Path, test_path: &Path, insecure_crs_gen: bool) -
         test_path,
         insecure_crs_gen,
         2048,
-        200,
+        SLOW_OP_MAX_ITER,
         *DEFAULT_EPOCH_ID,
         *DEFAULT_MPC_CONTEXT,
     )
@@ -1101,6 +1153,9 @@ async fn integration_test_commands(
     let cp = |val: &str, dt: FheType, bs: usize, no_comp: bool, no_sns: bool| {
         cipher_params(val, dt, key_id, bs, no_comp, no_sns, None)
     };
+    let ucp = |val: &str, dt: FheType, bs: usize, no_comp: bool, no_sns: bool| {
+        user_decrypt_params(val, dt, key_id, bs, no_comp, no_sns)
+    };
 
     // Commands without SnS precompute (no_precompute_sns=true)
     let commands = vec![
@@ -1111,7 +1166,7 @@ async fn integration_test_commands(
             false,
             true,
         ))),
-        CCCommand::UserDecrypt(CipherArguments::FromArgs(cp(
+        CCCommand::UserDecrypt(UserDecryptArguments::FromArgs(ucp(
             "0x1",
             FheType::Ebool,
             1,
@@ -1146,7 +1201,7 @@ async fn integration_test_commands(
             false,
             true,
         ))),
-        CCCommand::UserDecrypt(CipherArguments::FromArgs(cp(
+        CCCommand::UserDecrypt(UserDecryptArguments::FromArgs(ucp(
             "0xC958D835E4B1922CE9B13BAD322CF67D81CE14B95D225928E4E9B5305EC4592C",
             FheType::Euint256,
             3,
@@ -1169,13 +1224,10 @@ async fn integration_test_commands(
             parallel_requests: 1,
             inter_request_delay_ms: 0,
         })),
-        CCCommand::UserDecrypt(CipherArguments::FromFile(CipherFile {
-            input_path: ctxt_path.clone(),
-            batch_size: 3,
-            num_requests: 3,
-            parallel_requests: 1,
-            inter_request_delay_ms: 0,
-        })),
+        CCCommand::UserDecrypt(UserDecryptArguments::FromFile(user_decrypt_file(
+            ctxt_path.clone(),
+            3,
+        ))),
     ];
 
     // Commands with SnS precompute (no_precompute_sns=false)
@@ -1187,14 +1239,14 @@ async fn integration_test_commands(
             true,
             false,
         ))),
-        CCCommand::UserDecrypt(CipherArguments::FromArgs(cp(
+        CCCommand::UserDecrypt(UserDecryptArguments::FromArgs(ucp(
             "0x78",
             FheType::Euint8,
             2,
             true,
             false,
         ))),
-        CCCommand::UserDecrypt(CipherArguments::FromArgs(cp(
+        CCCommand::UserDecrypt(UserDecryptArguments::FromArgs(ucp(
             "0x1",
             FheType::Ebool,
             1,
@@ -1215,7 +1267,7 @@ async fn integration_test_commands(
             true,
             false,
         ))),
-        CCCommand::UserDecrypt(CipherArguments::FromArgs(cp(
+        CCCommand::UserDecrypt(UserDecryptArguments::FromArgs(ucp(
             "0xC9BF913158B2F39228DF1CA037D537E521CE14B95D225928E4E9B5305EC4592F",
             FheType::Euint256,
             3,
@@ -1238,13 +1290,10 @@ async fn integration_test_commands(
             parallel_requests: 1,
             inter_request_delay_ms: 0,
         })),
-        CCCommand::UserDecrypt(CipherArguments::FromFile(CipherFile {
-            input_path: ctxt_with_sns_path.clone(),
-            batch_size: 3,
-            num_requests: 3,
-            parallel_requests: 1,
-            inter_request_delay_ms: 0,
-        })),
+        CCCommand::UserDecrypt(UserDecryptArguments::FromFile(user_decrypt_file(
+            ctxt_with_sns_path.clone(),
+            3,
+        ))),
     ];
 
     let all_commands = [commands, commands_for_sns_precompute].concat();
@@ -1258,10 +1307,13 @@ async fn integration_test_commands(
 
         // Validate result count matches expected requests
         match &command {
-            CCCommand::PublicDecrypt(cipher_arguments)
-            | CCCommand::UserDecrypt(cipher_arguments) => {
+            CCCommand::PublicDecrypt(cipher_arguments) => {
                 let num_expected_results = cipher_arguments.get_num_requests();
                 assert_eq!(results.len(), num_expected_results);
+            }
+            CCCommand::UserDecrypt(_) => {
+                assert!(results.is_empty());
+                continue;
             }
             _ => {}
         }
@@ -1363,6 +1415,9 @@ async fn integration_test_commands_default_keys(
     let cp = |val: &str, dt: FheType, bs: usize, no_sns: bool| {
         cipher_params(val, dt, key_id, bs, false, no_sns, None)
     };
+    let ucp = |val: &str, dt: FheType, bs: usize, no_sns: bool| {
+        user_decrypt_params(val, dt, key_id, bs, false, no_sns)
+    };
 
     let commands = vec![
         CCCommand::PublicDecrypt(CipherArguments::FromArgs(cp(
@@ -1371,7 +1426,7 @@ async fn integration_test_commands_default_keys(
             2,
             true,
         ))),
-        CCCommand::UserDecrypt(CipherArguments::FromArgs(cp(
+        CCCommand::UserDecrypt(UserDecryptArguments::FromArgs(ucp(
             "0x78",
             FheType::Euint8,
             2,
@@ -1383,7 +1438,7 @@ async fn integration_test_commands_default_keys(
             3,
             false,
         ))),
-        CCCommand::UserDecrypt(CipherArguments::FromArgs(cp(
+        CCCommand::UserDecrypt(UserDecryptArguments::FromArgs(ucp(
             "0xC958D835E4B1922CE9B13BAD322CF67D81CE14B95D225928E4E9B5305EC4592C",
             FheType::Euint256,
             3,
@@ -1399,10 +1454,13 @@ async fn integration_test_commands_default_keys(
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         match &command {
-            CCCommand::PublicDecrypt(cipher_arguments)
-            | CCCommand::UserDecrypt(cipher_arguments) => {
+            CCCommand::PublicDecrypt(cipher_arguments) => {
                 let num_expected_results = cipher_arguments.get_num_requests();
                 assert_eq!(results.len(), num_expected_results);
+            }
+            CCCommand::UserDecrypt(_) => {
+                assert!(results.is_empty());
+                continue;
             }
             _ => {}
         }
@@ -1710,10 +1768,15 @@ async fn real_preproc_and_keygen_with_context(
             uncompressed: false,
             from_existing_shares: false,
         }),
-        200,
+        SLOW_OP_MAX_ITER,
     );
 
+    let t0 = std::time::Instant::now();
     let preproc_id = run_cmd(&preproc_config, test_path, "preprocessing with context").await?;
+    info!(
+        "Preprocessing with context done with ID {preproc_id:?} (elapsed: {:.1}s)",
+        t0.elapsed().as_secs_f64()
+    );
 
     let keygen_config = cmd_config(
         config_path,
@@ -1725,10 +1788,15 @@ async fn real_preproc_and_keygen_with_context(
                 ..Default::default()
             },
         }),
-        200,
+        SLOW_OP_MAX_ITER,
     );
 
+    let t1 = std::time::Instant::now();
     let key_id = run_cmd(&keygen_config, test_path, "key-gen with context").await?;
+    info!(
+        "Key-gen with context done (elapsed: {:.1}s)",
+        t1.elapsed().as_secs_f64()
+    );
 
     Ok((key_id.to_string(), preproc_id.to_string()))
 }
@@ -1778,14 +1846,14 @@ async fn new_custodian_context(
     config_path: &Path,
     test_path: &Path,
     custodian_threshold: u32,
-    setup_msg_paths: Vec<PathBuf>,
+    setup_msgs: Vec<String>,
 ) -> String {
     let config = cmd_config(
         config_path,
         CCCommand::NewCustodianContext(NewCustodianContextParameters {
             threshold: custodian_threshold,
-            setup_msg_paths,
-            mpc_context_id: DEFAULT_MPC_CONTEXT.to_string(),
+            setup_msgs,
+            mpc_context_id: *DEFAULT_MPC_CONTEXT,
         }),
         200,
     );
@@ -1862,23 +1930,12 @@ fn parse_custodian_bin_returns_none_when_absent() {
     assert_eq!(parse_custodian_bin(stdout), None);
 }
 
-async fn generate_custodian_keys_to_file(
-    temp_dir: &Path,
-    custodian_count: usize,
-) -> Result<(Vec<String>, Vec<PathBuf>)> {
+async fn generate_custodian_keys(custodian_count: usize) -> Result<(Vec<String>, Vec<String>)> {
     let mut seeds = Vec::new();
-    let mut setup_msgs_paths = Vec::new();
+    let mut setup_msgs = Vec::new();
     let custodian_bin = build_kms_custodian()?;
 
     for cus_idx in 1..=custodian_count {
-        let cur_setup_path = temp_dir
-            .join("CUSTODIAN")
-            .join("setup-msg")
-            .join(format!("setup-{}", cus_idx));
-
-        // Ensure the dir exists
-        create_dir_all(cur_setup_path.parent().unwrap()).unwrap();
-
         let cmd_output = Command::new(&custodian_bin)
             .args([
                 "generate",
@@ -1888,8 +1945,6 @@ async fn generate_custodian_keys_to_file(
                 &cus_idx.to_string(),
                 "--custodian-name",
                 &format!("skynet-{cus_idx}"),
-                "--path",
-                cur_setup_path.to_str().unwrap(),
             ])
             .output()?;
         assert!(
@@ -1898,12 +1953,26 @@ async fn generate_custodian_keys_to_file(
             String::from_utf8_lossy(&cmd_output.stderr)
         );
 
+        let setup_msg = extract_setup_message(&cmd_output);
         let seed_phrase = extract_seed_phrase(cmd_output);
         seeds.push(seed_phrase);
-        setup_msgs_paths.push(cur_setup_path);
+        setup_msgs.push(setup_msg);
     }
 
-    Ok((seeds, setup_msgs_paths))
+    Ok((seeds, setup_msgs))
+}
+
+fn extract_setup_message(out: &Output) -> String {
+    let output_string = String::from_utf8_lossy(&out.stdout);
+    let setup_msg_line = output_string
+        .lines()
+        .find(|line| line.contains(SETUP_MESSAGE_DESC))
+        .expect("generate output should contain the custodian setup message");
+    setup_msg_line
+        .split_at(setup_msg_line.find(SETUP_MESSAGE_DESC).unwrap() + SETUP_MESSAGE_DESC.len())
+        .1
+        .trim()
+        .to_string()
 }
 
 fn extract_seed_phrase(out: Output) -> String {
@@ -1928,15 +1997,10 @@ fn extract_seed_phrase(out: Output) -> String {
 }
 
 /// Native implementation: Initialize custodian backup using isolated config.
-async fn custodian_backup_init(
-    config_path: &Path,
-    test_path: &Path,
-    operator_recovery_resp_paths: Vec<PathBuf>,
-) {
+async fn custodian_backup_init(config_path: &Path, test_path: &Path) -> Vec<String> {
     let config = cmd_config(
         config_path,
         CCCommand::CustodianRecoveryInit(RecoveryInitParameters {
-            operator_recovery_resp_paths,
             overwrite_ephemeral_key: false,
         }),
         200,
@@ -1945,47 +2009,23 @@ async fn custodian_backup_init(
         .await
         .expect("backup init: execute_cmd failed");
     assert_eq!(results.len(), 1, "backup init: expected 1 result");
+    results.into_iter().map(|res| res.1).collect()
 }
 
 /// Native implementation: Re-encrypt custodian backups using kms-custodian binary directly
 async fn custodian_reencrypt(
-    temp_dir: &Path,
     amount_operators: usize,
     custodian_count: usize,
-    backup_id: RequestId,
-    mpc_context_id: ContextId,
     seeds: &[String],
-    recovery_paths: &[PathBuf],
-) -> Result<Vec<PathBuf>> {
-    let mut response_paths = Vec::new();
+    operator_recovery_resps: &[String],
+) -> Result<Vec<String>> {
+    let mut cus_rec_resps = Vec::new();
     let custodian_bin = build_kms_custodian()?;
 
     for operator_index in 1..=amount_operators {
-        let pub_prefix = if amount_operators == 1 {
-            "PUB".to_string()
-        } else {
-            format!("PUB-p{}", operator_index)
-        };
-
-        let cur_recovery_path = &recovery_paths[operator_index - 1];
+        let cur_recovery_resp = &operator_recovery_resps[operator_index - 1];
 
         for custodian_index in 1..=custodian_count {
-            let cur_response_path = temp_dir
-                .join("CUSTODIAN")
-                .join("response")
-                .join(backup_id.to_string())
-                .join(format!(
-                    "recovery-response-{}-{}",
-                    operator_index, custodian_index,
-                ));
-
-            create_dir_all(cur_response_path.parent().unwrap()).unwrap();
-
-            let verf_path = temp_dir
-                .join(&pub_prefix)
-                .join(PubDataType::VerfKey.to_string())
-                .join(SIGNING_KEY_ID.to_string());
-
             let cmd_output = Command::new(&custodian_bin)
                 .args([
                     "decrypt",
@@ -1993,14 +2033,8 @@ async fn custodian_reencrypt(
                     &seeds[custodian_index - 1],
                     "--custodian-role",
                     &custodian_index.to_string(),
-                    "--operator-verf-key",
-                    verf_path.to_str().unwrap(),
-                    "--mpc-context-id",
-                    &mpc_context_id.to_string(),
                     "-b",
-                    cur_recovery_path.to_str().unwrap(),
-                    "-o",
-                    cur_response_path.to_str().unwrap(),
+                    cur_recovery_resp,
                 ])
                 .output()?;
 
@@ -2010,17 +2044,19 @@ async fn custodian_reencrypt(
                 String::from_utf8_lossy(&cmd_output.stderr)
             );
 
-            response_paths.push(cur_response_path);
+            cus_rec_resps.push(extract_custodian_decryption_payload(
+                &String::from_utf8_lossy(&cmd_output.stdout),
+            ));
         }
     }
-    Ok(response_paths)
+    Ok(cus_rec_resps)
 }
 
 /// Native implementation: Recover custodian backup using isolated config
 async fn custodian_backup_recovery(
     config_path: &Path,
     test_path: &Path,
-    custodian_recovery_outputs: Vec<PathBuf>,
+    custodian_recovery_outputs: Vec<String>,
     backup_id: RequestId,
 ) -> String {
     let config = cmd_config(
@@ -2034,6 +2070,18 @@ async fn custodian_backup_recovery(
     run_cmd(&config, test_path, "backup recovery")
         .await
         .unwrap()
+        .to_string()
+}
+
+fn extract_custodian_decryption_payload(output_string: &str) -> String {
+    let payload_line = output_string
+        .lines()
+        .find(|line| line.contains(RECOVERY_OUTPUT_DESC))
+        .expect("a successful decryption prints the recovery output");
+    payload_line
+        .split_at(payload_line.find(RECOVERY_OUTPUT_DESC).unwrap() + RECOVERY_OUTPUT_DESC.len())
+        .1
+        .trim()
         .to_string()
 }
 
@@ -2273,59 +2321,28 @@ async fn test_centralized_custodian_backup() -> Result<()> {
     let temp_path = material_dir.path();
 
     // Generate custodian keys using native kms-custodian binary
-    let (seeds, setup_msg_paths) =
-        generate_custodian_keys_to_file(temp_path, amount_custodians).await?;
+    let (seeds, setup_msgs) = generate_custodian_keys(amount_custodians).await?;
 
     // Create custodian context
-    let cus_backup_id = new_custodian_context(
-        &config_path,
-        temp_path,
-        custodian_threshold,
-        setup_msg_paths,
-    )
-    .await;
-
-    let operator_recovery_resp_path = temp_path
-        .join("CUSTODIAN")
-        .join("recovery")
-        .join(&cus_backup_id)
-        .join("central");
-
-    // Ensure the dir exists
-    create_dir_all(operator_recovery_resp_path.parent().unwrap())?;
+    let cus_backup_id =
+        new_custodian_context(&config_path, temp_path, custodian_threshold, setup_msgs).await;
 
     // Initialize custodian backup
-    custodian_backup_init(
-        &config_path,
-        temp_path,
-        vec![operator_recovery_resp_path.clone()],
-    )
-    .await;
+    let operator_recovery_resp = custodian_backup_init(&config_path, temp_path).await;
 
     // Re-encrypt with custodian keys
-    let recovery_output_paths = custodian_reencrypt(
-        temp_path,
-        1,
-        amount_custodians,
-        RequestId::from_str(&cus_backup_id)?,
-        *DEFAULT_MPC_CONTEXT,
-        &seeds,
-        &[operator_recovery_resp_path],
-    )
-    .await?;
+    let custodian_recovery_output =
+        custodian_reencrypt(1, amount_custodians, &seeds, &operator_recovery_resp).await?;
 
     // Recover backup using custodian outputs
     let recovery_backup_id = custodian_backup_recovery(
         &config_path,
         temp_path,
-        recovery_output_paths,
+        custodian_recovery_output,
         RequestId::from_str(&cus_backup_id)?,
     )
     .await;
     assert_eq!(cus_backup_id, recovery_backup_id);
-
-    // Restore from backup
-    restore_from_backup(&config_path, temp_path).await?;
 
     Ok(())
 }
@@ -2361,8 +2378,10 @@ async fn nightly_tests_threshold_sequential_preproc_keygen() -> Result<()> {
 
     // Run sequential preprocessing and keygen operations (use material_dir as keys_folder)
     let keys_folder = material_dir.path();
-    let key_id_1 = real_preproc_and_keygen(&config_path, keys_folder, 200, false).await?;
-    let key_id_2 = real_preproc_and_keygen(&config_path, keys_folder, 200, false).await?;
+    let key_id_1 =
+        real_preproc_and_keygen(&config_path, keys_folder, SLOW_OP_MAX_ITER, false).await?;
+    let key_id_2 =
+        real_preproc_and_keygen(&config_path, keys_folder, SLOW_OP_MAX_ITER, false).await?;
 
     // Verify different key IDs generated
     assert_ne!(key_id_1, key_id_2);
@@ -2395,8 +2414,8 @@ async fn test_threshold_concurrent_preproc_keygen() -> Result<()> {
         &keys_folder_2.path().join("CLIENT"),
     )?;
     let _ = join_all([
-        real_preproc_and_keygen(&config_path, keys_folder_1.path(), 200, false),
-        real_preproc_and_keygen(&config_path, keys_folder_2.path(), 200, false),
+        real_preproc_and_keygen(&config_path, keys_folder_1.path(), SLOW_OP_MAX_ITER, false),
+        real_preproc_and_keygen(&config_path, keys_folder_2.path(), SLOW_OP_MAX_ITER, false),
     ])
     .await;
 
@@ -2527,8 +2546,10 @@ async fn test_threshold_default_preproc_keygen() -> Result<()> {
         setup_isolated_threshold_cli_test_with_prss("threshold_default_preproc_keygen", 4).await?;
 
     let keys_folder = material_dir.path();
-    let key_id_1 = real_preproc_and_keygen(&config_path, keys_folder, 200, false).await?;
-    let key_id_2 = real_preproc_and_keygen(&config_path, keys_folder, 200, false).await?;
+    let key_id_1 =
+        real_preproc_and_keygen(&config_path, keys_folder, SLOW_OP_MAX_ITER, false).await?;
+    let key_id_2 =
+        real_preproc_and_keygen(&config_path, keys_folder, SLOW_OP_MAX_ITER, false).await?;
 
     assert_ne!(key_id_1, key_id_2);
 
@@ -2650,75 +2671,47 @@ async fn test_threshold_custodian_backup() -> Result<()> {
 
     let amount_custodians = 5;
     let custodian_threshold = 2;
-    let amount_operators = 4;
+    let party_count = 4;
 
     // Setup isolated threshold KMS servers with custodian backup vaults (includes SecretSharingKeychain)
     let (material_dir, _servers, config_path) =
-        setup_isolated_threshold_cli_test_with_custodian_backup(
-            "threshold_custodian",
-            amount_operators,
-        )
-        .await?;
+        setup_isolated_threshold_cli_test_with_custodian_backup("threshold_custodian", party_count)
+            .await?;
 
     let temp_path = material_dir.path();
 
+    // TODO(#3042)
+    // Custodian backup/recovery currently runs against a single core at a time.
+    let single_core_config_path = single_core_config(&config_path)?;
+
     // Generate custodian keys using native kms-custodian binary
-    let (seeds, setup_msg_paths) =
-        generate_custodian_keys_to_file(temp_path, amount_custodians).await?;
+    let (seeds, setup_msgs) = generate_custodian_keys(amount_custodians).await?;
 
     // Create custodian context
     let cus_backup_id = new_custodian_context(
-        &config_path,
+        &single_core_config_path,
         temp_path,
         custodian_threshold,
-        setup_msg_paths,
+        setup_msgs,
     )
     .await;
-    // Paths to where the results of the backup init will be stored
-    let mut operator_recovery_resp_paths = Vec::new();
-    for cur_op_idx in 1..=amount_operators {
-        let cur_resp_path = temp_path
-            .join("CUSTODIAN")
-            .join("recovery")
-            .join(&cus_backup_id)
-            .join(cur_op_idx.to_string());
-        // Ensure the dir exists locally
-        assert!(create_dir_all(cur_resp_path.parent().unwrap()).is_ok());
-        operator_recovery_resp_paths.push(cur_resp_path);
-    }
 
     // Initialize custodian backup
-    custodian_backup_init(
-        &config_path,
-        temp_path,
-        operator_recovery_resp_paths.clone(),
-    )
-    .await;
+    let operator_recovery_resps = custodian_backup_init(&single_core_config_path, temp_path).await;
 
-    // Re-encrypt with custodian keys
-    let recovery_output_paths = custodian_reencrypt(
-        temp_path,
-        amount_operators,
-        amount_custodians,
-        RequestId::from_str(&cus_backup_id)?,
-        *DEFAULT_MPC_CONTEXT,
-        &seeds,
-        &operator_recovery_resp_paths,
-    )
-    .await?;
+    // Re-encrypt with custodian keys (single operator)
+    let custodian_recovery_output =
+        custodian_reencrypt(1, amount_custodians, &seeds, &operator_recovery_resps).await?;
 
     // Recover backup using custodian outputs
     let recovery_backup_id = custodian_backup_recovery(
-        &config_path,
+        &single_core_config_path,
         temp_path,
-        recovery_output_paths,
+        custodian_recovery_output,
         RequestId::from_str(&cus_backup_id)?,
     )
     .await;
     assert_eq!(cus_backup_id, recovery_backup_id);
-
-    // Restore from backup
-    restore_from_backup(&config_path, temp_path).await?;
 
     Ok(())
 }
@@ -2757,14 +2750,14 @@ async fn nightly_full_gen_tests_default_threshold_sequential_preproc_keygen() ->
         &config_path,
         keys_folder,
         PARTIAL_PREPROC_PERCENTAGE_OFFLINE,
-        200,
+        SLOW_OP_MAX_ITER,
     )
     .await?;
     let key_id_2 = real_partial_preproc_and_keygen(
         &config_path,
         keys_folder,
         PARTIAL_PREPROC_PERCENTAGE_OFFLINE,
-        200,
+        SLOW_OP_MAX_ITER,
     )
     .await?;
     info!(
