@@ -43,24 +43,28 @@ key.path = "certs/key_p4.pem"
 [[threshold.peers]]
 party_id = 1
 address = "p1"
+mpc_identity = "p1"
 port = 50001
 tls_cert.path = "certs/cert_p1.pem"
 
 [[threshold.peers]]
 party_id = 2
 address = "p2"
+mpc_identity = "p2"
 port = 50002
 tls_cert.path = "certs/cert_p2.pem"
 
 [[threshold.peers]]
 party_id = 3
 address = "p3"
+mpc_identity = "p3"
 port = 50003
 tls_cert.path = "certs/cert_p3.pem"
 
 [[threshold.peers]]
 party_id = 4
 address = "p4"
+mpc_identity = "p4"
 port = 50004
 tls_cert.path = "certs/cert_p4.pem"
 
